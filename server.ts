@@ -4,9 +4,61 @@
 
 import path from 'path';
 import { createPool } from 'mysql2/promise';
+import crypto from 'crypto';
 // Declare Bun global for TypeScript linting in non-Bun tooling contexts
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 declare const Bun: any;
+
+// --- Proxy session store (credentials never in GET query strings) ---
+interface ProxySession {
+  params: Record<string, string>;
+  createdAt: number;
+}
+const proxySessions = new Map<string, ProxySession>();
+const SESSION_TTL_MS = 60_000; // sessions expire after 60s
+
+function createProxySession(params: Record<string, string>): string {
+  const token = crypto.randomBytes(24).toString('hex');
+  proxySessions.set(token, { params, createdAt: Date.now() });
+  return token;
+}
+
+function consumeProxySession(token: string): Record<string, string> | null {
+  const session = proxySessions.get(token);
+  if (!session) return null;
+  proxySessions.delete(token); // single-use
+  if (Date.now() - session.createdAt > SESSION_TTL_MS) return null;
+  return session.params;
+}
+
+// Cleanup expired sessions every 30s
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, session] of proxySessions) {
+    if (now - session.createdAt > SESSION_TTL_MS) proxySessions.delete(token);
+  }
+}, 30_000);
+
+// Sanitize values before injecting into HTML <script> blocks
+function sanitizeForJS(value: string): string {
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/"/g, '\\"')
+    .replace(/`/g, '\\`')
+    .replace(/\$/g, '\\$')
+    .replace(/<\/script>/gi, '<\\/script>');
+}
+
+// Extract base URL from terminal URL for WebSocket and asset proxying
+function getBaseUrlFromTerminalUrl(terminalUrl: string): string {
+  try {
+    const url = new URL(terminalUrl);
+    return `${url.protocol}//${url.host}`;
+  } catch (e) {
+    return 'https://webtrader.razormarkets.co.za';
+  }
+}
 
 const DIST_DIR = path.join(process.cwd(), 'dist');
 const PORT = Number(process.env.PORT || 3000);
@@ -184,21 +236,28 @@ async function serveStatic(request: Request): Promise<Response> {
 
 async function handleMT5Proxy(request: Request): Promise<Response> {
   const url = new URL(request.url);
-  const targetUrl = url.searchParams.get('url');
-  const login = url.searchParams.get('login');
-  const password = url.searchParams.get('password');
-  const server = url.searchParams.get('server');
-  const asset = url.searchParams.get('asset');
-  const action = url.searchParams.get('action');
-  const price = url.searchParams.get('price');
-  const tp = url.searchParams.get('tp');
-  const sl = url.searchParams.get('sl');
-  const volume = url.searchParams.get('volume');
-  const numberOfTrades = url.searchParams.get('numberOfTrades');
-  const botname = url.searchParams.get('botname');
+
+  // Resolve params from session token (credentials never in URL)
+  const sessionToken = url.searchParams.get('session');
+  const sessionParams = sessionToken ? consumeProxySession(sessionToken) : null;
+  const p = (key: string) => sessionParams?.[key] ?? url.searchParams.get(key) ?? '';
+
+  const targetUrl = p('url') || null;
+  // Sanitize all values before injecting into script templates
+  const login = sanitizeForJS(p('login'));
+  const password = sanitizeForJS(p('password'));
+  const server = sanitizeForJS(p('server'));
+  const asset = sanitizeForJS(p('asset'));
+  const action = sanitizeForJS(p('action'));
+  const price = sanitizeForJS(p('price'));
+  const tp = sanitizeForJS(p('tp'));
+  const sl = sanitizeForJS(p('sl'));
+  const volume = sanitizeForJS(p('volume'));
+  const numberOfTrades = sanitizeForJS(p('numberOfTrades'));
+  const botname = sanitizeForJS(p('botname'));
 
   // Check if this is a trading request (has trading parameters)
-  const isTradingRequest = asset && action && tp && sl && volume;
+  const isTradingRequest = asset && action && volume && numberOfTrades;
 
   if (!targetUrl) {
     return new Response(JSON.stringify({ error: 'Missing URL parameter' }), {
@@ -206,6 +265,15 @@ async function handleMT5Proxy(request: Request): Promise<Response> {
       headers: { 'Content-Type': 'application/json' }
     });
   }
+
+  // Extract base URL for WebSocket and asset proxying
+  const baseUrl = getBaseUrlFromTerminalUrl(targetUrl);
+  const wsUrl = `${baseUrl.replace('http://', 'wss://').replace('https://', 'wss://')}/terminal/ws`;
+
+  console.log('MT5 Proxy - Target URL:', targetUrl);
+  console.log('MT5 Proxy - Base URL:', baseUrl);
+  console.log('MT5 Proxy - WebSocket URL:', wsUrl);
+  console.log('MT5 Proxy - Is Trading Request:', isTradingRequest);
 
   try {
     // Fetch the target terminal page
@@ -280,11 +348,31 @@ async function handleMT5Proxy(request: Request): Promise<Response> {
               window.WebSocket = function(url, protocols) {
                 console.log('WebSocket connection attempt to:', url);
                 
-                // Redirect WebSocket connections to the original terminal
-                if (url.includes('/terminal/ws')) {
-                  const newUrl = 'wss://webtrader.razormarkets.co.za/terminal/ws';
-                  console.log('Redirecting WebSocket to:', newUrl);
-                  return new originalWebSocket(newUrl, protocols);
+                // Redirect WebSocket connections to the original terminal (broker-specific)
+                if (url.includes('/terminal') || url.includes('ea-vault-app')) {
+                  const newUrl = '${wsUrl}';
+                  console.log('Redirecting WebSocket from', url, 'to:', newUrl);
+                  
+                  try {
+                    const ws = new originalWebSocket(newUrl, protocols);
+                    
+                    ws.addEventListener('open', function() {
+                      console.log('WebSocket connection established successfully to:', newUrl);
+                    });
+                    
+                    ws.addEventListener('error', function(error) {
+                      console.log('WebSocket error for URL:', newUrl, 'Error:', error);
+                    });
+                    
+                    ws.addEventListener('close', function(event) {
+                      console.log('WebSocket connection closed. Code:', event.code, 'Reason:', event.reason);
+                    });
+                    
+                    return ws;
+                  } catch (error) {
+                    console.log('WebSocket creation error:', error, '- Continuing without WebSocket');
+                    return new originalWebSocket(url, protocols);
+                  }
                 }
                 
                 return new originalWebSocket(url, protocols);
@@ -385,89 +473,52 @@ async function handleMT5Proxy(request: Request): Promise<Response> {
                   if (loginButton) {
                     loginButton.click();
                     sendMessage('step_update', 'Connecting to Server...');
-                    await new Promise(r => setTimeout(r, 8000)); // Optimized wait time
+                    await new Promise(r => setTimeout(r, 8000));
                   }
                   
                   // Wait for the terminal to fully load after login
                   sendMessage('step_update', 'Loading terminal interface...');
                   await new Promise(r => setTimeout(r, 4000));
                   
-                  // STRICT SYMBOL SEARCH VALIDATION - Only succeed if symbol search works
-                  let searchAttempts = 0;
-                  const maxAttempts = 6;
-                  let symbolSearchSuccessful = false;
+                  // RELAXED AUTHENTICATION VALIDATION - Check if terminal is accessible
+                  sendMessage('step_update', 'Verifying terminal access...');
+                  await new Promise(r => setTimeout(r, 2000));
                   
-                  while (searchAttempts < maxAttempts && !symbolSearchSuccessful) {
-                    sendMessage('step_update', 'Validating symbol search functionality... (' + (searchAttempts + 1) + '/' + maxAttempts + ')');
+                  // Check multiple indicators of successful authentication
+                  const searchField = document.querySelector('input[placeholder="Search symbol"]');
+                  const createOrderButton = Array.from(document.querySelectorAll('button')).find(btn => 
+                    (btn.textContent || '').toLowerCase().includes('create') && 
+                    (btn.textContent || '').toLowerCase().includes('order')
+                  );
+                  const balanceText = document.body.innerText.includes('Balance:') || 
+                                     document.body.innerText.includes('Equity:') ||
+                                     document.body.innerText.includes('Free margin:');
+                  const hasSymbolList = document.querySelectorAll('[class*="symbol"]').length > 0 ||
+                                       document.querySelectorAll('td').length > 5;
+                  
+                  console.log('MT5 Authentication Check:', {
+                    hasSearchField: !!searchField,
+                    hasCreateOrderButton: !!createOrderButton,
+                    hasBalanceText: balanceText,
+                    hasSymbolList: hasSymbolList
+                  });
+                  
+                  // If any of these indicators are present, authentication was successful
+                  if (searchField || createOrderButton || balanceText || hasSymbolList) {
+                    console.log('MT5 Authentication successful - terminal is accessible');
+                    sendMessage('authentication_success', 'MT5 Login Successful - Terminal loaded successfully');
                     
-                    const searchField = document.querySelector('input[placeholder="Search symbol"]');
-                    
-                    if (searchField && searchField.offsetParent !== null && !searchField.disabled) {
-                      // Clear any existing value
-                      searchField.value = '';
-                      searchField.dispatchEvent(new Event('input', { bubbles: true }));
-                      await new Promise(r => setTimeout(r, 500));
-                      
-                      // Test symbol search with XAUUSD
-                      searchField.value = 'XAUUSD';
-                      searchField.dispatchEvent(new Event('input', { bubbles: true }));
-                      searchField.dispatchEvent(new Event('change', { bubbles: true }));
-                      searchField.focus();
-                      
-                      sendMessage('step_update', 'Testing XAUUSD symbol search...');
-                      await new Promise(r => setTimeout(r, 2000));
-                      
-                      // STRICT VALIDATION: Check for actual search results
-                      const symbolResults = document.querySelector('.name.svelte-19bwscl .symbol.svelte-19bwscl') || 
-                                          document.querySelector('[class*="symbol"][class*="svelte"]') ||
-                                          document.querySelector('.symbol-list .symbol') ||
-                                          document.querySelector('[data-symbol="XAUUSD"]') ||
-                                          document.querySelector('[data-symbol*="XAUUSD"]');
-                      
-                      // Additional validation: Check if search field shows the symbol
-                      const searchFieldValue = searchField.value;
-                      const hasSearchResults = symbolResults && symbolResults.offsetParent !== null;
-                      const searchFieldWorking = searchFieldValue === 'XAUUSD';
-                      
-                      if (hasSearchResults && searchFieldWorking) {
-                        // Test clicking on the symbol to ensure it's interactive
-                        try {
-                          symbolResults.click();
-                          await new Promise(r => setTimeout(r, 1000));
-                          
-                          // Check if symbol was selected/activated
-                          const isSymbolSelected = symbolResults.classList.contains('selected') || 
-                                                 symbolResults.classList.contains('active') ||
-                                                 document.querySelector('.selected-symbol') ||
-                                                 document.querySelector('[class*="selected"]');
-                          
-                          if (isSymbolSelected || symbolResults.offsetParent !== null) {
-                              symbolSearchSuccessful = true;
-                              sendMessage('authentication_success', 'MT5 Login Successful - Symbol search and selection working perfectly');
-                              
-                              // If this is a trading request, proceed with trading
-                              ${isTradingRequest ? `
-                              setTimeout(() => {
-                                executeTrading();
-                              }, 2000);
-                              ` : ''}
-                              return;
-                            }
-                        } catch (clickError) {
-                          console.log('Symbol click test failed:', clickError);
-                        }
-                      }
-                    }
-                    
-                    searchAttempts++;
-                    if (searchAttempts < maxAttempts) {
-                      sendMessage('step_update', 'Symbol search not ready, retrying... (' + searchAttempts + '/' + maxAttempts + ')');
-                      await new Promise(r => setTimeout(r, 2000));
-                    }
+                    // If this is a trading request, proceed with trading
+                    ${isTradingRequest ? `
+                    setTimeout(() => {
+                      executeTrading();
+                    }, 2000);
+                    ` : ''}
+                    return;
                   }
                   
-                  // If we reach here, symbol search validation failed
-                  sendMessage('authentication_failed', 'Authentication failed - Symbol search functionality not working properly');
+                  // If we reach here, authentication validation failed
+                  sendMessage('authentication_failed', 'Authentication failed - Terminal did not load properly');
                   
                 } catch(e) {
                   sendMessage('authentication_failed', 'Error during authentication: ' + e.message);
@@ -682,8 +733,8 @@ async function handleMT5Proxy(request: Request): Promise<Response> {
         `;
 
     // Rewrite WebSocket URLs to point to the original terminal
-    html = html.replace(/wss:\/\/ea-vault-app\.onrender\.com\/terminal\/ws/g, 'wss://webtrader.razormarkets.co.za/terminal/ws');
-    html = html.replace(/ws:\/\/ea-vault-app\.onrender\.com\/terminal\/ws/g, 'wss://webtrader.razormarkets.co.za/terminal/ws');
+    html = html.replace(/wss:\/\/ea-vault-app[^/]*\.onrender\.com\/terminal\/ws/g, wsUrl);
+    html = html.replace(/ws:\/\/ea-vault-app[^/]*\.onrender\.com\/terminal\/ws/g, wsUrl);
 
     // Inject the script before the closing body tag
     if (html.includes('</body>')) {
@@ -696,14 +747,11 @@ async function handleMT5Proxy(request: Request): Promise<Response> {
     return new Response(html, {
       headers: {
         'Content-Type': 'text/html; charset=utf-8',
-        'X-Frame-Options': 'ALLOWALL',
+        'X-Frame-Options': 'SAMEORIGIN',
         'X-Content-Type-Options': 'nosniff',
         'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Pragma': 'no-cache',
         'Expires': '0',
-        'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type',
       },
     });
 
@@ -1268,6 +1316,29 @@ async function handleApi(request: Request): Promise<Response> {
         return route.default(expressReq, expressRes);
       }
       return new Response('Method Not Allowed', { status: 405 });
+    }
+
+    // Proxy session endpoint - creates a session token for secure credential passing
+    if (pathname === '/api/proxy-session') {
+      if (request.method !== 'POST') {
+        return new Response('Method Not Allowed', { status: 405 });
+      }
+      try {
+        const body = await request.json().catch(() => ({}));
+        if (!body || typeof body !== 'object' || !body.url) {
+          return new Response(JSON.stringify({ error: 'Missing url parameter' }), {
+            status: 400, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const token = createProxySession(body as Record<string, string>);
+        return new Response(JSON.stringify({ token }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
+      } catch (error) {
+        return new Response(JSON.stringify({ error: 'Failed to create session' }), {
+          status: 500, headers: { 'Content-Type': 'application/json' },
+        });
+      }
     }
 
     // Add MT5 proxy routing

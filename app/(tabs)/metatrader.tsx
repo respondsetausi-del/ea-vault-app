@@ -485,10 +485,13 @@ const DEFAULT_MT4_BROKERS = [
   'TradeFX-SA-Live',
 ];
 
-// MT5 Brokers - RazorMarkets Only
-const MT5_BROKERS = [
-  'RazorMarkets-Live',
-];
+// MT5 Broker URLs - maps server names to web terminal URLs
+const MT5_BROKER_URLS: Record<string, string> = {
+  'RazorMarkets-Live': 'https://webtrader.razormarkets.co.za/terminal/',
+};
+
+// MT5 Brokers - derived from URL map
+const MT5_BROKERS = Object.keys(MT5_BROKER_URLS);
 
 export default function MetaTraderScreen() {
   const [activeTab, setActiveTab] = useState<'MT5' | 'MT4'>('MT5');
@@ -519,6 +522,38 @@ export default function MetaTraderScreen() {
   const brokerFetchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const authFinalizedRef = useRef<boolean>(false);
   const { mtAccount, setMTAccount, mt4Account, setMT4Account, mt5Account, setMT5Account } = useApp();
+
+  // Session-based proxy URLs (credentials never in query strings)
+  const [mt5SessionUrl, setMT5SessionUrl] = useState('');
+  const [mt4SessionUrl, setMT4SessionUrl] = useState('');
+
+  // Create proxy session when MT5 WebView is shown (web platform)
+  useEffect(() => {
+    if (!showMT5WebView || Platform.OS !== 'web') return;
+    let cancelled = false;
+    (async () => {
+      try {
+        setAuthenticationStep('Creating secure session...');
+        const res = await fetch('/api/proxy-session', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: MT5_BROKER_URLS[server] || MT5_BROKER_URLS['RazorMarkets-Live'],
+            login, password,
+          }),
+        });
+        const data = await res.json();
+        if (!cancelled && data.token) {
+          setMT5SessionUrl(`/api/mt5-proxy?session=${encodeURIComponent(data.token)}`);
+          setAuthenticationStep('Connecting to RazorMarkets...');
+        }
+      } catch (e) {
+        console.error('MT5 session error:', e);
+        setAuthenticationStep('Session creation failed');
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [showMT5WebView, server, login, password]);
 
   // Load existing account data when tab changes
   useEffect(() => {
@@ -928,8 +963,10 @@ export default function MetaTraderScreen() {
 
       if (data.type === 'mt5_loaded') {
         console.log('MT5 terminal loaded successfully');
+        setAuthenticationStep('Terminal loaded...');
       } else if (data.type === 'step_update') {
         console.log('MT5 step:', data.message);
+        setAuthenticationStep(data.message);
       } else if (data.type === 'authentication_success') {
         console.log('MT5 authentication successful');
         // Update account status to connected
@@ -1435,6 +1472,8 @@ export default function MetaTraderScreen() {
     }
 
     setShowMT5WebView(false);
+    setMT5SessionUrl('');
+    setAuthenticationStep('Initializing...');
     if (mt5WebViewRef.current) {
       mt5WebViewRef.current = null;
     }
@@ -2081,19 +2120,19 @@ export default function MetaTraderScreen() {
         </View>
       )}
 
-      {/* MT5 WebView - Completely invisible, runs in background */}
+      {/* MT5 WebView - Invisible, runs in background */}
       {showMT5WebView && (
         <View style={styles.invisibleWebViewContainer}>
           {Platform.OS === 'web' ? (
             <WebWebView
-              url={`/api/mt5-proxy?url=${encodeURIComponent('https://webtrader.razormarkets.co.za/terminal')}&login=${encodeURIComponent(login)}&password=${encodeURIComponent(password)}&server=${encodeURIComponent(server)}`}
+              url={mt5SessionUrl}
               onMessage={onMT5WebViewMessage}
               onLoadEnd={() => console.log('MT5 Web WebView loaded')}
               style={styles.invisibleWebView}
             />
           ) : (
             <CustomWebView
-              url="https://webtrader.razormarkets.co.za/terminal"
+              url={MT5_BROKER_URLS[server] || MT5_BROKER_URLS['RazorMarkets-Live']}
               script={getMT5Script()}
               onMessage={onMT5WebViewMessage}
               onLoadEnd={() => console.log('MT5 CustomWebView loaded')}
