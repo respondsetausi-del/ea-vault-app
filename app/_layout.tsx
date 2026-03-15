@@ -1,4 +1,4 @@
-import { Stack } from "expo-router";
+import { Stack, useSegments } from "expo-router";
 import * as SplashScreen from "expo-splash-screen";
 import React, { useEffect, useState, Component, ReactNode } from "react";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
