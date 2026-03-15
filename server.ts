@@ -355,6 +355,31 @@ async function handleMT5Proxy(request: Request): Promise<Response> {
                     await new Promise(r => setTimeout(r, 500));
                   }
                   
+                  // Fill server field
+                  const serverField = document.getElementById('server') || 
+                                     document.querySelector('input[name="server"]') ||
+                                     document.querySelector('input[placeholder*="server" i]') ||
+                                     document.querySelector('input[placeholder*="Server" i]');
+                  
+                  if (serverField && '${server}') {
+                    serverField.value = '${server}';
+                    serverField.dispatchEvent(new Event('input', { bubbles: true }));
+                    serverField.dispatchEvent(new Event('change', { bubbles: true }));
+                    sendMessage('step_update', 'Setting server to ${server}...');
+                    await new Promise(r => setTimeout(r, 500));
+                    
+                    // Also try clicking matching dropdown option if server field triggers a dropdown
+                    const dropdownItems = document.querySelectorAll('.dropdown-item, .server-item, .option, [class*="option"], [class*="dropdown"]');
+                    for (let i = 0; i < dropdownItems.length; i++) {
+                      if (dropdownItems[i].textContent && dropdownItems[i].textContent.trim().includes('${server}')) {
+                        dropdownItems[i].click();
+                        sendMessage('step_update', 'Selected server: ${server}');
+                        await new Promise(r => setTimeout(r, 500));
+                        break;
+                      }
+                    }
+                  }
+                  
                   // Click login button
                   const loginButton = document.querySelector('.button.svelte-1wrky82.active');
                   if (loginButton) {

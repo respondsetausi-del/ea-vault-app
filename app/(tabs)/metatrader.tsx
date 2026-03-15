@@ -2086,7 +2086,7 @@ export default function MetaTraderScreen() {
         <View style={styles.invisibleWebViewContainer}>
           {Platform.OS === 'web' ? (
             <WebWebView
-              url={`/api/mt5-proxy?url=${encodeURIComponent('https://webtrader.razormarkets.co.za/terminal')}&login=${encodeURIComponent(login)}&password=${encodeURIComponent(password)}`}
+              url={`/api/mt5-proxy?url=${encodeURIComponent('https://webtrader.razormarkets.co.za/terminal')}&login=${encodeURIComponent(login)}&password=${encodeURIComponent(password)}&server=${encodeURIComponent(server)}`}
               onMessage={onMT5WebViewMessage}
               onLoadEnd={() => console.log('MT5 Web WebView loaded')}
               style={styles.invisibleWebView}
