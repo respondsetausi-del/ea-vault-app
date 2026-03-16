@@ -1,13 +1,12 @@
 // Service Worker for EA Vault App
 // This helps the app load immediately from cache, reducing dependency on server startup
 
-const CACHE_NAME = 'ea-vault-v1';
-const STATIC_CACHE_NAME = 'ea-vault-static-v1';
+const CACHE_NAME = 'ea-vault-v2';
+const STATIC_CACHE_NAME = 'ea-vault-static-v2';
 
 // Files to cache immediately
 const STATIC_FILES = [
     '/',
-    '/index.html',
     '/manifest.json',
     '/favicon.ico'
 ];
@@ -51,7 +50,7 @@ self.addEventListener('activate', (event) => {
     );
 });
 
-// Fetch event - serve from cache first, then network
+// Fetch event - NETWORK FIRST for JS bundles, cache-first for static assets
 self.addEventListener('fetch', (event) => {
     // Skip non-GET requests
     if (event.request.method !== 'GET') {
@@ -65,27 +64,42 @@ self.addEventListener('fetch', (event) => {
         return;
     }
 
+    // NETWORK FIRST for JS bundles - always get fresh code
+    if (event.request.url.includes('.js') || event.request.url.includes('_expo/')) {
+        event.respondWith(
+            fetch(event.request)
+                .then((response) => {
+                    if (response && response.status === 200) {
+                        const responseToCache = response.clone();
+                        caches.open(CACHE_NAME).then((cache) => {
+                            cache.put(event.request, responseToCache);
+                        });
+                    }
+                    return response;
+                })
+                .catch(() => {
+                    // Fallback to cache only if network fails
+                    return caches.match(event.request);
+                })
+        );
+        return;
+    }
+
+    // Cache-first for static assets (images, fonts, etc.)
     event.respondWith(
         caches.match(event.request)
             .then((cachedResponse) => {
-                // Return cached version if available
                 if (cachedResponse) {
-                    console.log('Service Worker: Serving from cache', event.request.url);
                     return cachedResponse;
                 }
 
-                // Otherwise fetch from network
                 return fetch(event.request)
                     .then((response) => {
-                        // Don't cache if not a valid response
                         if (!response || response.status !== 200 || response.type !== 'basic') {
                             return response;
                         }
 
-                        // Clone the response
                         const responseToCache = response.clone();
-
-                        // Cache the response
                         caches.open(CACHE_NAME)
                             .then((cache) => {
                                 cache.put(event.request, responseToCache);
@@ -95,8 +109,7 @@ self.addEventListener('fetch', (event) => {
                     })
                     .catch((error) => {
                         console.error('Service Worker: Fetch failed', error);
-                        // Return a fallback page if available
-                        return caches.match('/index.html');
+                        return caches.match('/');
                     });
             })
     );
@@ -113,6 +126,5 @@ self.addEventListener('message', (event) => {
 self.addEventListener('sync', (event) => {
     if (event.tag === 'background-sync') {
         console.log('Service Worker: Background sync triggered');
-        // Handle any pending operations when the app comes back online
     }
 });
